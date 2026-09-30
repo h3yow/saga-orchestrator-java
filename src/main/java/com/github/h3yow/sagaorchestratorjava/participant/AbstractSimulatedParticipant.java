@@ -46,6 +46,12 @@ public abstract class AbstractSimulatedParticipant implements ParticipantClient 
     /** 当前生效的故障计划，默认为无故障；测试可动态替换。 */
     private volatile FaultPlan faultPlan = FaultPlan.none();
 
+    /**
+     * 每次正常调用前的固定延迟（毫秒，&lt;=0 表示不延迟）。
+     * 仅影响无故障调用，用于并发测试中制造“调用进行中”的时间窗口；不影响故障/挂起注入。
+     */
+    private volatile long callDelayMillis = 0L;
+
     protected AbstractSimulatedParticipant(String name, SideEffectLedger ledger) {
         this.name = name;
         this.ledger = ledger;
@@ -61,10 +67,16 @@ public abstract class AbstractSimulatedParticipant implements ParticipantClient 
         this.faultPlan = faultPlan == null ? FaultPlan.none() : faultPlan;
     }
 
+    /** 设置每次正常调用前的固定延迟（测试使用）。 */
+    public void setCallDelayMillis(long callDelayMillis) {
+        this.callDelayMillis = Math.max(0L, callDelayMillis);
+    }
+
     /** 清空幂等记录与调用计数（测试隔离使用）。 */
     public void reset() {
         appliedKeys.clear();
         invocationCounters.clear();
+        callDelayMillis = 0L;
     }
 
     @Override
@@ -83,6 +95,18 @@ public abstract class AbstractSimulatedParticipant implements ParticipantClient 
         // 故障注入优先：命中则不生效、不记账
         for (FaultPlan.Rule rule : faultPlan.rules()) {
             if (rule.matches(invocation, direction, operation)) {
+                if (rule.hangForever()) {
+                    // 模拟下游卡死：不返回、不报错、不产生任何副作用、不记账。
+                    // 等待编排侧硬超时到达后中断本线程（cancel(true)）。
+                    log.warn("[{}] 模拟下游永久挂起（不返回/不报错/不记账）requestId={} {} operation={} 第{}次调用，等待编排侧硬超时掐断",
+                            name, requestId, direction, operation, invocation);
+                    hangUntilInterrupted();
+                    // 被中断后也不允许落到“生效”逻辑：以瞬时故障结束（编排侧通常已先按 ORCHESTRATOR_TIMEOUT 掐断）
+                    Thread.currentThread().interrupt();
+                    throw new ParticipantException(
+                            "参与方[" + name + "] 挂起被硬超时中断，本次调用未生效",
+                            com.github.h3yow.sagaorchestratorjava.core.FailureType.ORCHESTRATOR_TIMEOUT);
+                }
                 if (rule.sleepMillis() > 0) {
                     log.warn("[{}] 模拟下游阻塞 {}ms requestId={} {} operation={}",
                             name, rule.sleepMillis(), requestId, direction, operation);
@@ -93,6 +117,13 @@ public abstract class AbstractSimulatedParticipant implements ParticipantClient 
                 throw new ParticipantException(
                         "参与方[" + name + "] " + rule.message(), rule.type());
             }
+        }
+
+        long delay = callDelayMillis;
+        if (delay > 0) {
+            log.info("[{}] 模拟下游处理耗时 {}ms requestId={} {} operation={}",
+                    name, delay, requestId, direction, operation);
+            sleep(delay);
         }
 
         // 真实业务动作（本地模拟）。动作与“登记生效”之间由键集合的原子插入保证只生效一次。
@@ -129,6 +160,16 @@ public abstract class AbstractSimulatedParticipant implements ParticipantClient 
         int[] counter = invocationCounters.computeIfAbsent(direction + "|" + operation, k -> new int[1]);
         synchronized (counter) {
             return ++counter[0];
+        }
+    }
+
+    /** 无限等待直到被中断（编排侧硬超时 cancel(true)）；用于模拟下游永久卡死。 */
+    private static void hangUntilInterrupted() {
+        try {
+            Thread.sleep(Long.MAX_VALUE);
+        } catch (InterruptedException e) {
+            // 预期路径：被编排器硬超时中断，返回后由调用方按未生效处理
+            Thread.currentThread().interrupt();
         }
     }
 

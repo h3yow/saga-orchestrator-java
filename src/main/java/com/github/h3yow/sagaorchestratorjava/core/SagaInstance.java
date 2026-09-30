@@ -81,10 +81,12 @@ public class SagaInstance {
 
     /** 追加一条流水，序号单调递增。须在实例锁内调用。 */
     public HistoryEvent appendEvent(String eventType, String stepName, String detail) {
-        HistoryEvent event = new HistoryEvent(
-                ++sequence, System.currentTimeMillis(), requestId, eventType, stepName, detail);
-        history.add(event);
-        return event;
+        synchronized (this) {
+            HistoryEvent event = new HistoryEvent(
+                    ++sequence, System.currentTimeMillis(), requestId, eventType, stepName, detail);
+            history.add(event);
+            return event;
+        }
     }
 
     /** 流水快照（查询时使用）。 */

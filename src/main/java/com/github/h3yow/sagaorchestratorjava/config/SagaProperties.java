@@ -13,12 +13,17 @@ public class SagaProperties {
     private int circuitFailureThreshold = 3;
     private long circuitOpenMillis = 2000;
     private int circuitSuccessThreshold = 1;
+    /** 编排侧每次下游调用的硬超时时间上限（毫秒）；<=0 表示不启用硬超时。 */
+    private long callTimeoutMillis = 2000;
 
     public int getMaxAttempts() { return maxAttempts; }
     public void setMaxAttempts(int maxAttempts) { this.maxAttempts = maxAttempts; }
 
     public long getBackoffMillis() { return backoffMillis; }
     public void setBackoffMillis(long backoffMillis) { this.backoffMillis = backoffMillis; }
+
+    public long getCallTimeoutMillis() { return callTimeoutMillis; }
+    public void setCallTimeoutMillis(long callTimeoutMillis) { this.callTimeoutMillis = callTimeoutMillis; }
 
     public int getCircuitFailureThreshold() { return circuitFailureThreshold; }
     public void setCircuitFailureThreshold(int circuitFailureThreshold) {

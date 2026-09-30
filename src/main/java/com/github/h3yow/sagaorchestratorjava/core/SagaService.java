@@ -26,14 +26,14 @@ public class SagaService {
 
     private final SagaRepository repository;
     private final SagaOrchestrator orchestrator;
-    private final OrderSagaFactory orderSagaFactory;
+    private final SagaDefinitionRegistry registry;
 
     public SagaService(SagaRepository repository,
                        SagaOrchestrator orchestrator,
-                       OrderSagaFactory orderSagaFactory) {
+                       SagaDefinitionRegistry registry) {
         this.repository = repository;
         this.orchestrator = orchestrator;
-        this.orderSagaFactory = orderSagaFactory;
+        this.registry = registry;
     }
 
     /**
@@ -66,11 +66,25 @@ public class SagaService {
         return repository.find(requestId);
     }
 
+    /**
+     * 按业务类型选择流程：
+     * <ul>
+     *   <li>{@code businessType} 为空（缺省提交）时，显式选用下单流程 {@code ORDER_PLACEMENT}，
+     *       保持历史提交契约；</li>
+     *   <li>非空类型必须在注册表中存在，未注册一律拒绝（400），绝不静默套用默认流程。</li>
+     * </ul>
+     */
     private SagaDefinition resolveDefinition(String businessType) {
-        if (businessType == null
-                || OrderSagaFactory.BUSINESS_TYPE.equalsIgnoreCase(businessType)) {
-            return orderSagaFactory.create();
+        if (businessType == null || businessType.isBlank()) {
+            return registry.resolve(OrderSagaFactory.BUSINESS_TYPE);
         }
-        throw new IllegalArgumentException("未知业务类型: " + businessType);
+        if (!registry.supports(businessType)) {
+            log.warn("拒绝受理：businessType={} 未注册，已注册类型={}",
+                    businessType, registry.registeredTypes());
+            throw new IllegalArgumentException(
+                    "未注册的业务类型: " + businessType
+                            + "；已注册类型=" + registry.registeredTypes());
+        }
+        return registry.resolve(businessType);
     }
 }
