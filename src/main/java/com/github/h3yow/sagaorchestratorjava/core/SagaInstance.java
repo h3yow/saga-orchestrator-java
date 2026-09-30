@@ -30,7 +30,13 @@ public class SagaInstance {
     private final List<StepState> steps;
     private final Map<String, StepState> stepByName;
 
-    private SagaStatus status = SagaStatus.PENDING;
+    /**
+     * 生命周期状态。volatile 保证驱动线程在实例锁内写入后，任意并发查询线程立即可见，
+     * 使“任意时刻查询到的中间状态/终态”与真实推进保持自洽。
+     */
+    private volatile SagaStatus status = SagaStatus.PENDING;
+    /** 流水与序号的专用锁：允许查询/去重事件在不与驱动主锁竞争的情况下安全追加。 */
+    private final Object historyLock = new Object();
     private final List<HistoryEvent> history = new ArrayList<>();
     private long sequence = 0;
 
@@ -79,17 +85,25 @@ public class SagaInstance {
         return steps.size();
     }
 
-    /** 追加一条流水，序号单调递增。须在实例锁内调用。 */
+    /**
+     * 追加一条流水，序号单调递增、唯一、连续、无丢失无重复。
+     *
+     * <p>使用专用 {@code historyLock}，因此既可以在驱动主锁内调用，也可以在编排器锁外
+     * （如入口去重事件、并发查询快照）安全调用；序号在锁内自增，保证连续不跳号。
+     */
     public HistoryEvent appendEvent(String eventType, String stepName, String detail) {
-        HistoryEvent event = new HistoryEvent(
-                ++sequence, System.currentTimeMillis(), requestId, eventType, stepName, detail);
-        history.add(event);
+        HistoryEvent event;
+        synchronized (historyLock) {
+            event = new HistoryEvent(
+                    ++sequence, System.currentTimeMillis(), requestId, eventType, stepName, detail);
+            history.add(event);
+        }
         return event;
     }
 
-    /** 流水快照（查询时使用）。 */
+    /** 流水快照（查询时使用）：锁内拷贝，快照与序号自洽，不会读到追加到一半的列表。 */
     public List<HistoryEvent> history() {
-        synchronized (this) {
+        synchronized (historyLock) {
             return List.copyOf(history);
         }
     }
@@ -97,8 +111,11 @@ public class SagaInstance {
     /**
      * 单调状态迁移。非法迁移抛异常；目标与当前相同则忽略（重放幂等）；
      * 终态只允许保持，不允许再迁移到其它状态。
+     *
+     * <p>方法自身 synchronized，即使调用方未持实例锁也能保证状态单调、不回退；
+     * 编排驱动在实例监视器内串行化，状态判断-迁移的完整协议仍由驱动主锁保证。
      */
-    public void transitionTo(SagaStatus target) {
+    public synchronized void transitionTo(SagaStatus target) {
         if (target == status) {
             return;
         }

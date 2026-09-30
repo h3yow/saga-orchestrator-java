@@ -26,14 +26,14 @@ public class SagaService {
 
     private final SagaRepository repository;
     private final SagaOrchestrator orchestrator;
-    private final OrderSagaFactory orderSagaFactory;
+    private final SagaDefinitionRegistry definitionRegistry;
 
     public SagaService(SagaRepository repository,
                        SagaOrchestrator orchestrator,
-                       OrderSagaFactory orderSagaFactory) {
+                       SagaDefinitionRegistry definitionRegistry) {
         this.repository = repository;
         this.orchestrator = orchestrator;
-        this.orderSagaFactory = orderSagaFactory;
+        this.definitionRegistry = definitionRegistry;
     }
 
     /**
@@ -42,11 +42,18 @@ public class SagaService {
      * @return 该 requestId 对应的唯一实例（终态可安全反复查询）
      */
     public SagaInstance submit(String requestId, String businessType) {
-        SagaDefinition definition = resolveDefinition(businessType);
+        SagaDefinition definition = definitionRegistry.resolve(businessType);
         SagaRepository.Stored stored = repository.createIfAbsent(requestId, definition);
         SagaInstance instance = stored.instance();
 
         if (!stored.created()) {
+            // 同一 requestId 必须始终对应同一业务流程：换类型提交属于调用方错误，明确拒绝，
+            // 避免把“开户”的补偿误套到“下单”实例上
+            if (!instance.definition().type().equalsIgnoreCase(definition.type())) {
+                throw new IllegalArgumentException(
+                        "requestId=" + requestId + " 已按业务类型[" + instance.definition().type()
+                                + "]受理，不能改用业务类型[" + definition.type() + "]重复提交");
+            }
             log.info("requestId={} 重复提交，命中已有实例(当前状态={})，不新建编排",
                     requestId, instance.status());
             instance.appendEvent("SUBMIT_DEDUPED", null,
@@ -64,13 +71,5 @@ public class SagaService {
 
     public Optional<SagaInstance> query(String requestId) {
         return repository.find(requestId);
-    }
-
-    private SagaDefinition resolveDefinition(String businessType) {
-        if (businessType == null
-                || OrderSagaFactory.BUSINESS_TYPE.equalsIgnoreCase(businessType)) {
-            return orderSagaFactory.create();
-        }
-        throw new IllegalArgumentException("未知业务类型: " + businessType);
     }
 }

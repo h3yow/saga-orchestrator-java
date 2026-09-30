@@ -60,4 +60,27 @@ class SagaControllerSmokeTest {
         mvc.perform(get("/api/sagas/not-exist"))
                 .andExpect(status().isNotFound());
     }
+
+    /** 未注册的业务类型必须明确拒绝（400），不能静默套用默认流程；开户流程可通过 HTTP 选中。 */
+    @Test
+    void unknownBusinessTypeRejected_andAccountOpeningSelectableOverHttp() throws Exception {
+        mvc.perform(post("/api/sagas")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"http-bad-type\",\"businessType\":\"UNKNOWN_X\"}"))
+                .andExpect(status().isBadRequest());
+
+        // 空白业务类型同样 400
+        mvc.perform(post("/api/sagas")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"http-blank-type\",\"businessType\":\"   \"}"))
+                .andExpect(status().isBadRequest());
+
+        // 开户四步流程可通过 businessType=ACCOUNT_OPENING 选中
+        mvc.perform(post("/api/sagas")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"requestId\":\"http-acct-001\",\"businessType\":\"ACCOUNT_OPENING\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("COMPLETED"))
+                .andExpect(jsonPath("$.steps.length()").value(4));
+    }
 }

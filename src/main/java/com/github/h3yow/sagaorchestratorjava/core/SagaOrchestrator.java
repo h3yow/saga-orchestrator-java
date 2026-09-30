@@ -91,11 +91,14 @@ public class SagaOrchestrator {
                 instance.appendEvent("STEP_EXECUTED", step.name(), "正向成功并已生效");
                 log.info("requestId={} 步骤[{}]执行成功", instance.requestId(), step.name());
             } catch (ParticipantException e) {
-                state.markFailed(e.failureType(), e.getMessage());
+                state.markFailed(e.failureType(), e.rootFailureType(), e.getMessage());
                 instance.appendEvent("STEP_FAILED", step.name(),
-                        "失败分类=" + e.failureType() + "；判定依据=" + e.getMessage());
-                log.warn("requestId={} 步骤[{}]失败，失败分类={} 原因={}，准备逆序补偿",
-                        instance.requestId(), step.name(), e.failureType(), e.getMessage());
+                        "失败分类=" + e.failureType()
+                                + "；底层分类=" + e.rootFailureType() + describeTimeoutSource(e)
+                                + "；判定依据=" + e.getMessage());
+                log.warn("requestId={} 步骤[{}]失败，失败分类={} 底层分类={}{} 原因={}，准备逆序补偿",
+                        instance.requestId(), step.name(), e.failureType(), e.rootFailureType(),
+                        describeTimeoutSource(e), e.getMessage());
                 return i;
             }
         }
@@ -137,12 +140,15 @@ public class SagaOrchestrator {
                 instance.appendEvent("STEP_COMPENSATED", step.name(), "补偿成功");
                 log.info("requestId={} 步骤[{}]补偿成功", instance.requestId(), step.name());
             } catch (ParticipantException e) {
-                state.markCompensationFailed(e.failureType(), e.getMessage());
+                state.markCompensationFailed(e.failureType(), e.rootFailureType(), e.getMessage());
                 instance.appendEvent("STEP_COMPENSATION_FAILED", step.name(),
-                        "补偿失败分类=" + e.failureType() + "；判定依据=" + e.getMessage()
+                        "补偿失败分类=" + e.failureType()
+                                + "；底层分类=" + e.rootFailureType() + describeTimeoutSource(e)
+                                + "；判定依据=" + e.getMessage()
                                 + "；编排进入COMPENSATION_FAILED，需人工介入，禁止遗漏补偿");
-                log.error("requestId={} 步骤[{}]补偿失败({}): {} —— 进入COMPENSATION_FAILED终态",
-                        instance.requestId(), step.name(), e.failureType(), e.getMessage());
+                log.error("requestId={} 步骤[{}]补偿失败({}/{}): {} —— 进入COMPENSATION_FAILED终态",
+                        instance.requestId(), step.name(), e.failureType(),
+                        e.rootFailureType(), e.getMessage());
                 instance.transitionTo(SagaStatus.COMPENSATION_FAILED);
                 instance.appendEvent("SAGA_COMPENSATION_FAILED", null,
                         "存在补偿失败步骤，事务未完全回退，需人工介入");
@@ -154,5 +160,20 @@ public class SagaOrchestrator {
         instance.appendEvent("SAGA_COMPENSATED", null, "所有已生效步骤均已逆序补偿，事务完全回退");
         log.info("requestId={} ----- 补偿完成，编排终态(COMPENSATED)，无部分生效 -----",
                 instance.requestId());
+    }
+
+    /**
+     * 超时来源的人类可读判定说明：
+     * HARD_TIMEOUT = 编排侧达到时间上限主动掐断；TIMEOUT = 参与方自行判定并上报。
+     */
+    private static String describeTimeoutSource(ParticipantException e) {
+        FailureType root = e.rootFailureType();
+        if (root == FailureType.HARD_TIMEOUT) {
+            return "（编排侧硬超时主动掐断）";
+        }
+        if (root == FailureType.TIMEOUT) {
+            return "（参与方自报超时）";
+        }
+        return "";
     }
 }

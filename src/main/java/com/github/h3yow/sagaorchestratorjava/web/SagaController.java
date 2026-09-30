@@ -61,6 +61,7 @@ public class SagaController {
     private StepView toStepView(StepState state) {
         return new StepView(state.stepName(), state.status().name(),
                 state.failureType() == null ? null : state.failureType().name(),
+                state.rootCauseType() == null ? null : state.rootCauseType().name(),
                 state.failureMessage());
     }
 

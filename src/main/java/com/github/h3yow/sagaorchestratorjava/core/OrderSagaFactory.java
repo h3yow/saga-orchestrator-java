@@ -17,7 +17,7 @@ import java.util.List;
  * 任一步失败即按逆序补偿已生效步骤。
  */
 @Component
-public class OrderSagaFactory {
+public class OrderSagaFactory implements SagaFactory {
 
     public static final String BUSINESS_TYPE = "ORDER_PLACEMENT";
 
@@ -33,6 +33,12 @@ public class OrderSagaFactory {
         this.shipping = shipping;
     }
 
+    @Override
+    public String businessType() {
+        return BUSINESS_TYPE;
+    }
+
+    @Override
     public SagaDefinition create() {
         return new SagaDefinition(BUSINESS_TYPE, List.of(
                 new SagaStep("reserve-stock", inventory, "reserveStock", "releaseStock"),

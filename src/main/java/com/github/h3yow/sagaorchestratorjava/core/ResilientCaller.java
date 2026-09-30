@@ -10,13 +10,16 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * 对下游参与方调用统一施加弹性保护：
  * <ol>
+ *   <li><b>编排侧硬超时</b>：{@link HardTimeoutCaller} 给每一次下游调用设可配置时间上限，
+ *       超时主动掐断等待并归类 {@link FailureType#HARD_TIMEOUT}（可重试瞬时故障）；
+ *       参与方自报的 {@link FailureType#TIMEOUT} 仍照旧透传，两类超时在日志/结果中可区分。</li>
  *   <li><b>熔断</b>：参与方维度的熔断器，OPEN 时直接快速失败（{@link FailureType#CIRCUIT_OPEN}），
  *       不发起调用；OPEN 超时后放一次试探，成功自动恢复。</li>
- *   <li><b>有界重试</b>：仅对 {@link FailureType#TIMEOUT} / {@link FailureType#TRANSIENT} 重试，
- *       固定退避，最多 {@code maxAttempts} 次；耗尽后以 {@link FailureType#RETRIES_EXHAUSTED} 失败。</li>
+ *   <li><b>有界重试</b>：仅对 {@link FailureType#TIMEOUT} / {@link FailureType#HARD_TIMEOUT}
+ *       / {@link FailureType#TRANSIENT} 重试，固定退避，最多 {@code maxAttempts} 次；
+ *       耗尽后以 {@link FailureType#RETRIES_EXHAUSTED} 失败，并保留最后一次尝试的底层分类。</li>
  *   <li><b>不可重试失败</b>：{@link FailureType#BUSINESS} 立即上抛，不浪费调用。</li>
  * </ol>
- * 超时本身由参与方模拟（sleep 后抛 TIMEOUT），语义与真实下游超时一致。
  */
 @Component
 public class ResilientCaller {
@@ -24,10 +27,12 @@ public class ResilientCaller {
     private static final Logger log = LoggerFactory.getLogger(ResilientCaller.class);
 
     private final SagaProperties properties;
+    private final HardTimeoutCaller hardTimeoutCaller;
     private final ConcurrentHashMap<String, CircuitBreaker> breakers = new ConcurrentHashMap<>();
 
-    public ResilientCaller(SagaProperties properties) {
+    public ResilientCaller(SagaProperties properties, HardTimeoutCaller hardTimeoutCaller) {
         this.properties = properties;
+        this.hardTimeoutCaller = hardTimeoutCaller;
     }
 
     /** 由全局配置构造默认重试策略。 */
@@ -62,7 +67,8 @@ public class ResilientCaller {
 
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
-                participant.invoke(requestId, operation, direction);
+                hardTimeoutCaller.invokeWithHardTimeout(
+                        participant, requestId, operation, direction);
                 breaker.recordSuccess();
                 if (attempt > 1) {
                     log.info("[{}] {} requestId={} operation={} 第{}次尝试成功（瞬时故障已恢复）",
@@ -101,9 +107,12 @@ public class ResilientCaller {
             }
         }
 
+        FailureType root = last.rootFailureType();
+        log.warn("[{}] {} requestId={} operation={} 重试{}次后仍失败，最终分类=RETRIES_EXHAUSTED，底层分类={}（TIMEOUT=参与方自报, HARD_TIMEOUT=编排侧掐断, TRANSIENT=其他瞬时故障）",
+                key, direction, requestId, operation, maxAttempts, root);
         throw new ParticipantException(
-                "参与方[" + key + "]在" + maxAttempts + "次尝试后仍失败: " + last.getMessage(),
-                FailureType.RETRIES_EXHAUSTED, last);
+                "参与方[" + key + "]在" + maxAttempts + "次尝试后仍失败[" + root + "]: " + last.getMessage(),
+                FailureType.RETRIES_EXHAUSTED, root);
     }
 
     /** 查询某参与方当前熔断状态（测试/诊断使用）。 */

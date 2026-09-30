@@ -38,8 +38,8 @@ public abstract class AbstractSimulatedParticipant implements ParticipantClient 
     /** 已生效调用的幂等键集合。 */
     private final Set<String> appliedKeys = ConcurrentHashMap.newKeySet();
     /**
-     * 参与方维度的调用计数（键含方向/操作，不含 requestId）：
-     * 同一请求的多次重试、不同请求的多次调用都会累计，用于驱动故障计划与熔断。
+     * 调用计数（键含 requestId/方向/操作）：统计“某请求在某参与方某操作上的第几次调用”，
+     * 用于驱动按请求生效的故障计划（重试次数、按请求挂起等）。
      */
     private final Map<String, int[]> invocationCounters = new ConcurrentHashMap<>();
 
@@ -78,11 +78,20 @@ public abstract class AbstractSimulatedParticipant implements ParticipantClient 
             return;
         }
 
-        int invocation = nextInvocation(direction, operation);
+        int invocation = nextInvocation(requestId, direction, operation);
 
         // 故障注入优先：命中则不生效、不记账
         for (FaultPlan.Rule rule : faultPlan.rules()) {
-            if (rule.matches(invocation, direction, operation)) {
+            if (rule.matches(invocation, requestId, direction, operation)) {
+                if (rule.type() == com.github.h3yow.sagaorchestratorjava.core.FailureType.HANG) {
+                    // 模拟下游长期卡住：只睡眠、不上报错误；被编排侧硬超时中断时立即终止，
+                    // 中断路径不会执行后续 doExecute、不会写入已生效集合，因此绝不留下副作用
+                    log.warn("[{}] 模拟下游长期不返回，最长挂起{}ms requestId={} {} operation={}（等待编排侧硬超时掐断）",
+                            name, rule.sleepMillis(), requestId, direction, operation);
+                    hangInterruptibly(rule.sleepMillis(), requestId, direction, operation);
+                    // hangInterruptibly 唯一的正常返回路径是“未被中断地睡满”，同样视为未生效，结束本次调用
+                    return;
+                }
                 if (rule.sleepMillis() > 0) {
                     log.warn("[{}] 模拟下游阻塞 {}ms requestId={} {} operation={}",
                             name, rule.sleepMillis(), requestId, direction, operation);
@@ -125,8 +134,9 @@ public abstract class AbstractSimulatedParticipant implements ParticipantClient 
         // no-op
     }
 
-    private int nextInvocation(String direction, String operation) {
-        int[] counter = invocationCounters.computeIfAbsent(direction + "|" + operation, k -> new int[1]);
+    private int nextInvocation(String requestId, String direction, String operation) {
+        int[] counter = invocationCounters.computeIfAbsent(
+                requestId + "|" + direction + "|" + operation, k -> new int[1]);
         synchronized (counter) {
             return ++counter[0];
         }
@@ -139,6 +149,27 @@ public abstract class AbstractSimulatedParticipant implements ParticipantClient 
             Thread.currentThread().interrupt();
             throw new ParticipantException("模拟阻塞被中断",
                     com.github.h3yow.sagaorchestratorjava.core.FailureType.TRANSIENT, e);
+        }
+    }
+
+    /**
+     * 可中断的长期挂起：
+     * <ul>
+     *   <li>被编排侧硬超时 {@code cancel(true)} 中断时：立即返回，调用方保证不执行业务动作、
+     *       不记账（本次调用被判定为未生效）；</li>
+     *   <li>未被中断地睡满 hangMillis：正常返回，同样不执行后续动作。</li>
+     * </ul>
+     */
+    private void hangInterruptibly(long hangMillis, String requestId,
+                                   String direction, String operation) {
+        try {
+            Thread.sleep(hangMillis);
+        } catch (InterruptedException e) {
+            // 编排侧硬超时主动掐断：工作线程在这里终止，绝不继续执行 doExecute。
+            // 清除（而非保留）中断标记，避免污染线程池中复用该线程的下一次调用。
+            Thread.interrupted();
+            log.warn("[{}] 挂起调用被编排侧硬超时中断，立即终止且不记账 requestId={} {} operation={} 判定依据: 收到中断信号",
+                    name, requestId, direction, operation);
         }
     }
 }
