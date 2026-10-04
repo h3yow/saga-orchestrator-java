@@ -25,8 +25,21 @@
 
 - 提交时按 `businessType` 选中对应流程；两种流程可以**同时跑、互不影响**：参与方完全不交叉，
   熔断器按参与方维度隔离，实例/流水/幂等键都按 requestId 隔离。
-- **未注册的业务类型一律明确拒绝**（HTTP 400，错误信息带已注册类型列表），不会默默套用默认流程；
-  请求里 `businessType` 留空时，为兼容历史提交契约仍显式选用 `ORDER_PLACEMENT`。
+- **业务类型选择规则**（`SagaService.resolveDefinition`，见下表）：只有请求里**完全不带**
+  `businessType` 字段（JSON 反序列化为 `null`）才按历史契约默认走 `ORDER_PLACEMENT`；
+  空串、纯空白、未注册类型一律明确拒绝，绝不静默回退到下单流程。
+
+| 提交的 businessType | 处理 | HTTP |
+|---|---|---|
+| 字段完全未携带（`null`） | 按历史提交契约默认 `ORDER_PLACEMENT` | 200 |
+| 空串 `""` / 纯空白 `"   "` | 视为“带了字段但内容为空”，**明确拒绝**，不建实例、不留任何副作用与流水 | 400 |
+| 未注册类型（如 `REFUND_ONLY`） | **明确拒绝**，错误信息带已注册类型列表，不套用默认流程 | 400 |
+| 已注册类型（大小写不同、首尾带空白，如 `" travel_booking "`） | 归一化（忽略大小写与首尾空白）后正常命中对应流程 | 200 |
+| 同一 requestId 换业务类型重复提交 | **明确拒绝**（与首次受理类型不一致），原实例终态与流水不受影响，保证“提交的是哪个类型，结果就是哪条流程” | 409 |
+| 同一 requestId 同型重复提交（含大小写/空白变体） | 幂等复用已有实例，不重复执行 | 200 |
+
+> 与历史提交约定的兼容范围：仅“完全不携带 businessType 字段”的老客户端不受影响，
+> 仍默认走下单流程；此前“空串/纯空白被当成没填而静默走下单”属于缺陷行为，本次已收紧为拒绝。
 
 ### 1.1 下单 Saga 定义（`core/OrderSagaFactory`）
 
@@ -192,20 +205,30 @@ mvn spring-boot:run
 提交（同一 `requestId` 重复 POST 是幂等的，返回同一终态）：
 
 ```bash
-# 下单流程（businessType 留空同样默认 ORDER_PLACEMENT）
+# 下单流程（完全不携带 businessType 字段时默认 ORDER_PLACEMENT）
 curl -s -X POST http://localhost:8080/api/sagas \
   -H 'Content-Type: application/json' \
   -d '{"requestId":"demo-001","businessType":"ORDER_PLACEMENT"}'
 
-# 差旅预订流程（四步，参与方与下单完全不同）
+# 差旅预订流程（四步，参与方与下单完全不同；大小写/首尾空白不敏感）
 curl -s -X POST http://localhost:8080/api/sagas \
   -H 'Content-Type: application/json' \
   -d '{"requestId":"trip-001","businessType":"TRAVEL_BOOKING"}'
+
+# 空串 / 纯空白：明确 400 拒绝，不会回退到下单流程，也不建实例
+curl -i -X POST http://localhost:8080/api/sagas \
+  -H 'Content-Type: application/json' \
+  -d '{"requestId":"bad-000","businessType":"   "}'
 
 # 未注册业务类型：明确 400 拒绝，不会套用默认流程
 curl -i -X POST http://localhost:8080/api/sagas \
   -H 'Content-Type: application/json' \
   -d '{"requestId":"bad-001","businessType":"NOT_REGISTERED"}'
+
+# 同一 requestId 换业务类型重复提交：明确 409 拒绝，原流程终态不受影响
+curl -i -X POST http://localhost:8080/api/sagas \
+  -H 'Content-Type: application/json' \
+  -d '{"requestId":"demo-001","businessType":"TRAVEL_BOOKING"}'
 ```
 
 查询单调状态与流水：
@@ -221,7 +244,7 @@ curl -s http://localhost:8080/api/sagas/demo-001
 ## 5. 本地验证方法
 
 ```bash
-# 运行全部测试（19 个，含既有 4 大场景 + 新增多流程/硬超时/高并发 + 基线 + HTTP 冒烟）
+# 运行全部测试（26 个，含既有 4 大场景 + 多流程/硬超时/高并发 + 业务类型边界 + 基线 + HTTP 冒烟）
 mvn test
 
 # 只看某个场景
@@ -231,6 +254,7 @@ mvn test -Dtest=HardTimeoutTest                 # 编排侧硬超时：下游卡
 mvn test -Dtest=FailureRollbackTest             # 业务失败立即回滚 / 补偿幂等
 mvn test -Dtest=CircuitBreakerTest              # 熔断开启快速失败 + 自动恢复
 mvn test -Dtest=TravelSagaTest                  # 第二种业务流程（四步）成功/逆序补偿/未知类型拒绝
+mvn test -Dtest=BusinessTypeValidationTest      # 业务类型边界：空串/空白/未注册拒绝、缺省默认、变体命中、换类型冲突
 mvn test -Dtest=MixedFlowConcurrencyTest        # 32线程两流程混合（重复+独立标识），并行不串行
 mvn test -Dtest=HighConcurrencyConsistencyTest  # 高并发下流水连续、状态单调、中途查询自洽
 mvn test -Dtest=ConcurrentCompensationTest      # 高并发失败补偿各自独立、补偿恰好一次
@@ -259,6 +283,7 @@ mvn test -Dtest=ConcurrentCompensationTest      # 高并发失败补偿各自独
 | `FailureRollbackTest` | 不可重试业务失败立即回滚（不重试）；回滚后重放补偿幂等 |
 | `CircuitBreakerTest` | 达阈值熔断 OPEN、OPEN 期间快速失败、恢复后 HALF_OPEN 试探成功 |
 | `TravelSagaTest` | 差旅四步流程成功；签证失败逆序补偿机票/酒店；未注册类型 400 拒绝且不建实例 |
+| `BusinessTypeValidationTest` | 空串/纯空白/未注册类型拒绝（不建实例、零副作用）；不带字段默认下单；大小写与首尾空白变体正常命中；同 requestId 换类型 409 拒绝且原实例不受影响；同型变体重复提交仍幂等 |
 | `MixedFlowConcurrencyTest` | 32 线程混合两流程 + 同标识重复 + 不同标识，验证并行、去重、流水、账本总数 |
 | `HighConcurrencyConsistencyTest` | 72 次提交/24 标识 + 并发查询：序号连续、状态单调、中途/终态快照自洽、流水可追溯 |
 | `ConcurrentCompensationTest` | 32 提交/16 个失败请求：并发补偿互不串台、补偿恰好一次 |
@@ -285,7 +310,7 @@ participant/
   Flight/Hotel/Visa/LoyaltyParticipant    差旅流程的四个本地模拟参与方
   FaultPlan                               故障注入（第N次超时/业务失败/持续失败/永久挂起）
   SideEffectLedger / LedgerEntry          副作用账本（测试断言依据）
-web/                REST 控制器、DTO、全局异常处理（未注册业务类型 -> 400）
+web/                REST 控制器、DTO、全局异常处理（非法/空业务类型 -> 400，同标识换类型 -> 409）
 config/             saga.resilience.* 配置属性绑定（含 call-timeout-millis）
 tests/              场景测试与统一日志打印
 ```
